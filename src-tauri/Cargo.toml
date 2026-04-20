@@ -4,6 +4,7 @@ description = "A blazingly-fast, non-destructive, and GPU-accelerated RAW image 
 authors = ["Timon Käch"]
 edition = "2024"
 rust-version = "1.94"
+default-run = "RapidRAW"
 
 [lib]
 name = "rapidraw_lib"
@@ -102,3 +103,12 @@ opt-level = 3
 codegen-units = 1
 lto = true
 strip = true
+
+# Fast-compile profile for profiling binaries. Same opt-level as release
+# but no LTO and debug symbols kept — much faster to build.
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = true

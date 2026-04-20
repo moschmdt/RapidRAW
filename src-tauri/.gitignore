@@ -8,3 +8,7 @@
 
 # Local dependency overrides
 /.cargo/config.toml
+
+# Test images and profiling results (large files, developer-local only)
+/test-images/
+profile.json.gz
