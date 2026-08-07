@@ -377,6 +377,151 @@ fn apply_curve(val: f32, points: array<Point, 16>, count: u32) -> f32 {
     return local_points[count - 1u].y / 255.0;
 }
 
+const TONE_PIVOT: f32 = 0.42;
+
+// Shadow/black recovery. Keep 1.25 * SHADOW_GAIN / SHADOW_RANGE + 3.75 * BLACK_GAIN /
+// BLACK_RANGE below 1.0 or the combined transfer stops being monotone.
+// The blacks slider divides by 40 and shadows by 120, so blacks arrives 3x larger
+// for the same slider position; BLACK_GAIN is scaled down to match.
+//
+// The falloff is linear rather than a smoothstep. smoothstep is flat at both ends, so
+// all of the compression the lift costs gets concentrated into the middle of the
+// range: at this strength it drove the transfer slope down to 0.11 around sRGB 25-50,
+// flattening exactly the shadows being recovered. A linear ramp spreads that cost
+// evenly and holds the slope near 0.27 instead.
+const SHADOW_GAIN: f32 = 0.150;
+const SHADOW_RANGE: f32 = 0.55;
+/// Where inside the shadow band the lift peaks, as a fraction of SHADOW_RANGE.
+const SHADOW_PEAK: f32 = 0.36;
+const BLACK_GAIN: f32 = 0.070;
+const BLACK_RANGE: f32 = 0.32;
+const DETAIL_GAIN: f32 = 9.0;
+const DETAIL_CLAMP: f32 = 0.18;
+const DETAIL_NOISE_FLOOR: f32 = 0.018;
+const CHROMA_DENOISE: f32 = 7.0;
+const CHROMA_DENOISE_MAX: f32 = 0.75;
+
+// Negative direction moves the black point. Much gentler than the positive gains:
+// everything below the new black point is lost, so this end needs a short throw.
+const SHADOW_BLACK_POINT: f32 = 0.030;
+const BLACK_BLACK_POINT: f32 = 0.020;
+
+const CONTRAST_STRENGTH: f32 = 1.15;
+
+// Shadow gate for clarity/structure/sharpness, in gamma space: 0.14 is about sRGB 36.
+// Only there to stop near-black sensor noise being amplified.
+const LOCAL_CONTRAST_TOE: f32 = 0.10;
+const LOCAL_CONTRAST_TOE_RAW: f32 = 0.14;
+
+// Base rendering curve applied to RAW when no tonemapper is selected.
+const BASE_BRIGHTNESS_GAMMA: f32 = 1.02;
+const BASE_CURVE_STRENGTH: f32 = 0.60;
+const HIGHLIGHT_SHOULDER_KNEE: f32 = 0.80;
+const HIGHLIGHT_SHOULDER_CEILING: f32 = 2.60;
+const HIGHLIGHT_SHOULDER_SOFTNESS: f32 = 0.5;
+const BASE_HIGHLIGHT_LIFT_START: f32 = 0.62;
+const BASE_HIGHLIGHT_LIFT: f32 = 0.0;
+const BASE_HIGHLIGHT_LIFT_WIDTH: f32 = 0.12;
+const HIGHLIGHT_LIFT_GAMUT: f32 = 0.35;
+
+// S-curve whose slope is bounded at both ends: (1 + |s|) at the pivot, falling to
+// 1 / (1 + |s|) at black and white. A power curve or a smoothstep both reach zero
+// slope at black, which collapses shadow detail into a single value.
+// The falloff term uses abs(n) rather than n * n so the end slope stays positive
+// for any strength; with n * n it turns negative once |s| exceeds 1.
+fn soft_s_curve(x: f32, strength: f32) -> f32 {
+    let p = clamp(x, 0.0, 1.0);
+    let reach = select(1.0 - TONE_PIVOT, TONE_PIVOT, p < TONE_PIVOT);
+    let n = (p - TONE_PIVOT) / reach;
+    let s = abs(strength);
+    var shaped: f32;
+    if (strength >= 0.0) {
+        shaped = n * (1.0 + s) / (1.0 + s * abs(n));
+    } else {
+        shaped = n * (1.0 + s * abs(n)) / (1.0 + s);
+    }
+    return clamp(TONE_PIVOT + shaped * reach, 0.0, 1.0);
+}
+
+// Shoulder in linear space: identity below the knee, rolling the reconstructed
+// over-range into the remaining headroom above it.
+//
+// Normalised so it reaches exactly 1.0 at HIGHLIGHT_SHOULDER_CEILING rather than
+// approaching it asymptotically. A plain Reinhard never gets there, which left the
+// blown core rendering as grey (peak 236) instead of white -- the sun ended up
+// darker than a bright cloud. Anchoring the top means the genuinely clipped core is
+// white, and everything between the knee and the ceiling fades down into the valid
+// pixels below it. Nothing under the knee is touched.
+fn highlight_shoulder(x: f32) -> f32 {
+    if (x <= HIGHLIGHT_SHOULDER_KNEE) {
+        return x;
+    }
+    let headroom = 1.0 - HIGHLIGHT_SHOULDER_KNEE;
+    let span = max(HIGHLIGHT_SHOULDER_CEILING - HIGHLIGHT_SHOULDER_KNEE, 0.001);
+    let over = x - HIGHLIGHT_SHOULDER_KNEE;
+    let softness = HIGHLIGHT_SHOULDER_SOFTNESS;
+    let curved = over / (over + softness);
+    let full = span / (span + softness);
+    return HIGHLIGHT_SHOULDER_KNEE + headroom * clamp(curved / full, 0.0, 1.0);
+}
+
+fn highlight_shoulder3(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        highlight_shoulder(c.r),
+        highlight_shoulder(c.g),
+        highlight_shoulder(c.b)
+    );
+}
+
+// Lift the top of the range toward white before it rolls off. The S-curve alone
+// reaches white too abruptly, so a bright region ends up as a hard-edged clipped
+// patch instead of fading out over a wide band. Weight is smoothstepped from the
+// start point, so midtones are untouched and the curve stays smooth through the
+// join; the (1 - x) factor makes it converge on white rather than overshoot it.
+fn highlight_lift(x: f32) -> f32 {
+    // Ramp in over a narrow window rather than all the way to 1.0. Spread across the
+    // whole top the lift is roughly uniform, which moves the highlights up without
+    // flattening them; confined to a window, the (1 - x) decay above it compresses
+    // the range instead, which is what turns an abrupt edge into a slow falloff.
+    let w = smoothstep(
+        BASE_HIGHLIGHT_LIFT_START,
+        BASE_HIGHLIGHT_LIFT_START + BASE_HIGHLIGHT_LIFT_WIDTH,
+        x
+    );
+    return clamp(x + (1.0 - x) * BASE_HIGHLIGHT_LIFT * w, 0.0, 1.0);
+}
+
+// Drive the lift from luminance and scale the channels together. Applying it per
+// channel shifts hue: in a warm glow the channels sit at different points on the
+// ramp, so they get different amounts of lift -- which showed up as a yellow-green
+// cast through the glow and magenta fringing along the cloud edges.
+fn highlight_lift3(c: vec3<f32>) -> vec3<f32> {
+    let safe = max(c, vec3<f32>(0.0));
+    let l = get_luma(safe);
+    if (l < 0.0001) {
+        return safe;
+    }
+    let scaled = safe * (highlight_lift(l) / l);
+
+    // Scaling by luminance can push a single channel past 1.0, and letting that clip
+    // per channel would reintroduce the hue shift. Converge on neutral instead, which
+    // is also what a highlight approaching clipping should do.
+    let mx = max(scaled.r, max(scaled.g, scaled.b));
+    if (mx <= 1.0) {
+        return scaled;
+    }
+    let over = clamp((mx - 1.0) / HIGHLIGHT_LIFT_GAMUT, 0.0, 1.0);
+    return mix(scaled, vec3<f32>(get_luma(scaled)), over);
+}
+
+fn soft_s_curve3(c: vec3<f32>, strength: f32) -> vec3<f32> {
+    return vec3<f32>(
+        soft_s_curve(c.r, strength),
+        soft_s_curve(c.g, strength),
+        soft_s_curve(c.b, strength)
+    );
+}
+
 fn apply_tonal_adjustments(
     color: vec3<f32>,
     blurred_color_input_space: vec3<f32>,
@@ -384,7 +529,8 @@ fn apply_tonal_adjustments(
     con: f32,
     sh: f32,
     wh: f32,
-    bl: f32
+    bl: f32,
+    exposure_gain: f32
 ) -> vec3<f32> {
     var rgb = color;
 
@@ -394,6 +540,13 @@ fn apply_tonal_adjustments(
     } else {
         blurred_linear = srgb_to_linear(blurred_color_input_space);
     }
+
+    // The blur texture is built from the image before exposure, while `rgb` already
+    // has it. Left unscaled the guide reads several stops too dark, so the shadow and
+    // black weights fire on tones that are nowhere near the shadows -- at exposure
+    // 2.4 a midtone at output 150 was being treated as if it sat at t = 0.21, which is
+    // why both sliders appeared to move the whole image.
+    blurred_linear *= max(exposure_gain, 0.0001);
 
     if (wh != 0.0) {
         let white_level = 1.0 - wh * 0.25;
@@ -412,39 +565,63 @@ fn apply_tonal_adjustments(
         let t_pixel = pow(safe_pixel_luma, 0.4545);
         let t_blurred = pow(safe_blurred_luma, 0.4545);
 
-        let shadow_lift = sh * t_pixel * pow(max(1.0 - t_pixel, 0.0), 4.5);
-        let black_lift = bl * t_pixel * pow(max(1.0 - t_pixel, 0.0), 12.0);
-        let lift_amount = max(shadow_lift + black_lift, 0.0);
+        // The lift is driven by the blurred neighbourhood, not by the pixel itself.
+        // A per-pixel additive lift has to fall back to zero and therefore always
+        // has a compressive flank, which flattens exactly the tones it recovers.
+        // Here the low frequency carries the move and the detail rides on top with
+        // gain >= 1, so micro-contrast survives the recovery.
+        // Blacks decays from the floor; shadows peaks above it. Giving both the same
+        // falling ramp made the two sliders near-duplicates -- blacks was just a
+        // narrower copy. Peaking shadows inside the band leaves the floor to blacks
+        // and, because the weight is still rising below the peak, actually steepens
+        // the deepest tones instead of flattening them.
+        let u_sh = t_blurred / SHADOW_RANGE;
+        let w_shadows = clamp(
+            select(
+                (1.0 - u_sh) / (1.0 - SHADOW_PEAK),
+                u_sh / SHADOW_PEAK,
+                u_sh < SHADOW_PEAK
+            ),
+            0.0,
+            1.0
+        );
+        let w_blacks = clamp(1.0 - t_blurred / BLACK_RANGE, 0.0, 1.0);
+        let lift = max(sh, 0.0) * SHADOW_GAIN * w_shadows + max(bl, 0.0) * BLACK_GAIN * w_blacks;
 
-        let t_pixel_curved = max(t_pixel + shadow_lift + black_lift, 0.0);
+        // Amplifying the detail residual is what keeps recovered shadows reading as
+        // texture rather than as fog. Two guards on it:
+        //
+        // noise_protection fades the boost out where the neighbourhood is near black,
+        // since down there the residual is mostly read noise.
+        //
+        // coring fades it out for small residuals at any brightness. Without it the
+        // gain is applied to sensor grain just as hard as to real edges, which raises
+        // measured micro-contrast while making the image look mushier rather than more
+        // detailed -- the boost has to follow structure, not variance.
+        let noise_protection = smoothstep(0.0, 0.06, t_blurred);
+        let raw_detail = t_pixel - t_blurred;
+        let coring = smoothstep(0.0, DETAIL_NOISE_FLOOR, abs(raw_detail));
+        let boosted = raw_detail * (1.0 + lift * DETAIL_GAIN * noise_protection * coring);
+        let detail = clamp(boosted, raw_detail - DETAIL_CLAMP, raw_detail + DETAIL_CLAMP);
 
-        let shadow_pivot = 0.2;
-        let stretch_factor = 1.0 + (lift_amount * 1.3);
-        let contrasted_t = shadow_pivot + (t_pixel_curved - shadow_pivot) * stretch_factor;
+        // Negative side is a black-point move: subtract the point and rescale what
+        // is left, so the surviving range keeps its contrast.
+        let black_point = max(-bl, 0.0) * BLACK_BLACK_POINT + max(-sh, 0.0) * SHADOW_BLACK_POINT;
+        let lifted_t = t_blurred + lift + detail;
+        let final_t = max((lifted_t - black_point) / max(1.0 - black_point, 0.2), 0.0);
 
-        let final_t = max(mix(t_pixel_curved, contrasted_t, 0.85), 0.0);
         let curved_luma = pow(final_t, 2.2);
+        rgb *= curved_luma / safe_pixel_luma;
 
-        let luma_ratio = curved_luma / safe_pixel_luma;
-        rgb *= luma_ratio;
-
-        let detail = t_pixel / max(t_blurred, 0.0001);
-        let safe_detail = clamp(detail, 0.8, 1.25);
-
-        let noise_protection = smoothstep(0.0, 0.1, t_blurred);
-
-        let detail_amp = 1.0 + (lift_amount * 1.2 * noise_protection);
-
-        let enhanced_detail = pow(safe_detail, detail_amp);
-        let detail_correction = enhanced_detail / safe_detail;
-
-        let linear_correction = pow(detail_correction, 2.2);
-        rgb *= linear_correction;
-
-        if (luma_ratio > 1.0) {
-            let recovered_luma = get_luma(rgb);
-            let boost_amount = clamp((luma_ratio - 1.0) * 0.15, 0.0, 0.4);
-            rgb = mix(rgb, vec3<f32>(recovered_luma), boost_amount);
+        // Lifting shadows scales chroma along with luma, so sensor colour speckle
+        // comes up with the detail and the result reads as mush rather than texture.
+        // Swap in the neighbourhood's chroma at this pixel's own luminance: luma, and
+        // therefore all the structure, is untouched -- only the colour is smoothed.
+        let chroma_mix = clamp(lift * CHROMA_DENOISE, 0.0, CHROMA_DENOISE_MAX);
+        if (chroma_mix > 0.001) {
+            let lifted_luma = get_luma(max(rgb, vec3<f32>(0.0)));
+            let neighbour_chroma = blurred_linear * (lifted_luma / safe_blurred_luma);
+            rgb = mix(rgb, neighbour_chroma, chroma_mix);
         }
     }
 
@@ -452,12 +629,7 @@ fn apply_tonal_adjustments(
         let safe_rgb = max(rgb, vec3<f32>(0.0));
         let g = 2.2;
         let perceptual = pow(safe_rgb, vec3<f32>(1.0 / g));
-        let clamped_perceptual = clamp(perceptual, vec3<f32>(0.0), vec3<f32>(1.0));
-        let strength = pow(2.0, con * 1.25);
-        let condition = clamped_perceptual < vec3<f32>(0.5);
-        let high_part = 1.0 - 0.5 * pow(2.0 * (1.0 - clamped_perceptual), vec3<f32>(strength));
-        let low_part = 0.5 * pow(2.0 * clamped_perceptual, vec3<f32>(strength));
-        let curved_perceptual = select(high_part, low_part, condition);
+        let curved_perceptual = soft_s_curve3(perceptual, con * CONTRAST_STRENGTH);
         let contrast_adjusted_rgb = pow(curved_perceptual, vec3<f32>(g));
         let mix_factor = smoothstep(vec3<f32>(1.0), vec3<f32>(1.01), safe_rgb);
         rgb = mix(contrast_adjusted_rgb, rgb, mix_factor);
@@ -724,7 +896,8 @@ fn apply_local_contrast(
     amount: f32,
     is_raw: u32,
     mode: u32,
-    threshold: f32
+    threshold: f32,
+    exposure_gain: f32
 ) -> vec3<f32> {
     if (amount == 0.0) {
         return processed_color_linear;
@@ -747,9 +920,17 @@ fn apply_local_contrast(
 
     let center_luma = get_luma(processed_color_linear);
 
-    let shadow_threshold = select(0.03, 0.1, is_raw == 1u);
-    let shadow_protection = smoothstep(0.0, shadow_threshold, center_luma);
-    let highlight_protection = 1.0 - smoothstep(0.9, 1.0, center_luma);
+    // This runs before exposure, so the mask has to be judged on where the pixel
+    // will actually land, not on its current value -- otherwise raising exposure
+    // scales the whole image below the shadow gate and positive clarity/structure
+    // silently stops doing anything. The gate is perceptual for the same reason:
+    // a linear 0.1 cutoff is sRGB 89, which is most of a normal image.
+    let exposed_luma = max(center_luma, 0.0) * max(exposure_gain, 0.0001);
+    let t_luma = pow(exposed_luma, 0.4545);
+
+    let shadow_threshold = select(LOCAL_CONTRAST_TOE, LOCAL_CONTRAST_TOE_RAW, is_raw == 1u);
+    let shadow_protection = smoothstep(0.0, shadow_threshold, t_luma);
+    let highlight_protection = 1.0 - smoothstep(0.95, 1.05, t_luma);
     let midtone_mask = shadow_protection * highlight_protection;
 
     if (midtone_mask < 0.001) {
@@ -784,7 +965,8 @@ fn apply_centre_local_contrast(
     centre_amount: f32,
     coords_i: vec2<i32>,
     blurred_color_srgb: vec3<f32>,
-    is_raw: u32
+    is_raw: u32,
+    exposure_gain: f32
 ) -> vec3<f32> {
     if (centre_amount == 0.0) {
         return color_in;
@@ -804,7 +986,7 @@ fn apply_centre_local_contrast(
     let clarity_strength = centre_amount * (2.0 * centre_mask - 1.0) * CLARITY_SCALE;
 
     if (abs(clarity_strength) > 0.001) {
-        processed_color = apply_local_contrast(processed_color, blurred_color_srgb, clarity_strength, is_raw, 1u, 0.0);
+        processed_color = apply_local_contrast(processed_color, blurred_color_srgb, clarity_strength, is_raw, 1u, 0.0, exposure_gain);
     }
 
     return processed_color;
@@ -1346,7 +1528,7 @@ fn apply_glow_bloom(
 
     blurred_linear = apply_linear_exposure(blurred_linear, exp);
     blurred_linear = apply_filmic_exposure(blurred_linear, bright);
-    blurred_linear = apply_tonal_adjustments(blurred_linear, blurred_color_input_space, is_raw, 0.0, 0.0, wh, 0.0);
+    blurred_linear = apply_tonal_adjustments(blurred_linear, blurred_color_input_space, is_raw, 0.0, 0.0, wh, 0.0, exp2(exp));
 
     let linear_luma = get_luma(max(blurred_linear, vec3<f32>(0.0)));
 
@@ -1414,7 +1596,7 @@ fn apply_halation(
 
     blurred_linear = apply_linear_exposure(blurred_linear, exp);
     blurred_linear = apply_filmic_exposure(blurred_linear, bright);
-    blurred_linear = apply_tonal_adjustments(blurred_linear, blurred_color_input_space, is_raw, 0.0, 0.0, wh, 0.0);
+    blurred_linear = apply_tonal_adjustments(blurred_linear, blurred_color_input_space, is_raw, 0.0, 0.0, wh, 0.0, exp2(exp));
 
     let linear_luma = get_luma(max(blurred_linear, vec3<f32>(0.0)));
 
@@ -1570,9 +1752,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var locally_contrasted_rgb = initial_linear_rgb;
 
+    // Local contrast runs ahead of exposure; the masks inside need to know the gain
+    // that is coming so they can judge tones by where they will end up.
+    let exposure_gain = exp2(t_exposure);
+
     locally_contrasted_rgb = apply_local_contrast(
         locally_contrasted_rgb, sharpness_blurred,
-        t_sharpness, is_raw, 0u, adjustments.global.sharpness_threshold
+        t_sharpness, is_raw, 0u, adjustments.global.sharpness_threshold, exposure_gain
     );
 
     var sharpness_delta = vec3<f32>(0.0);
@@ -1583,7 +1769,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             if (abs(m.sharpness) > 0.001) {
                 let local_sharp_result = apply_local_contrast(
                     initial_linear_rgb, sharpness_blurred,
-                    m.sharpness, is_raw, 0u, m.sharpness_threshold
+                    m.sharpness, is_raw, 0u, m.sharpness_threshold, exposure_gain
                 );
                 sharpness_delta += (local_sharp_result - initial_linear_rgb) * influence;
             }
@@ -1591,9 +1777,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     locally_contrasted_rgb += sharpness_delta;
 
-    locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, clarity_blurred, t_clarity, is_raw, 1u, 0.0);
-    locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, structure_blurred, t_structure, is_raw, 1u, 0.0);
-    locally_contrasted_rgb = apply_centre_local_contrast(locally_contrasted_rgb, adjustments.global.centre, absolute_coord_i, clarity_blurred, is_raw);
+    locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, clarity_blurred, t_clarity, is_raw, 1u, 0.0, exposure_gain);
+    locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, structure_blurred, t_structure, is_raw, 1u, 0.0, exposure_gain);
+    locally_contrasted_rgb = apply_centre_local_contrast(locally_contrasted_rgb, adjustments.global.centre, absolute_coord_i, clarity_blurred, is_raw, exposure_gain);
 
     var processed_rgb = apply_linear_exposure(locally_contrasted_rgb, t_exposure);
 
@@ -1629,7 +1815,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     composite_rgb_linear = apply_white_balance(composite_rgb_linear, t_temperature, t_tint);
     composite_rgb_linear = apply_centre_tonal_and_color(composite_rgb_linear, adjustments.global.centre, absolute_coord_i);
     composite_rgb_linear = apply_filmic_exposure(composite_rgb_linear, t_brightness);
-    composite_rgb_linear = apply_tonal_adjustments(composite_rgb_linear, tonal_blurred, is_raw, t_contrast, t_shadows, t_whites, t_blacks);
+    composite_rgb_linear = apply_tonal_adjustments(composite_rgb_linear, tonal_blurred, is_raw, t_contrast, t_shadows, t_whites, t_blacks, exposure_gain);
     composite_rgb_linear = apply_highlights_adjustment(composite_rgb_linear, tonal_blurred, is_raw, t_highlights);
     composite_rgb_linear = apply_color_calibration(composite_rgb_linear, adjustments.global.color_calibration);
     composite_rgb_linear = apply_hsl_panel(composite_rgb_linear, final_hsl, absolute_coord_i);
@@ -1681,12 +1867,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (adjustments.global.tonemapper_mode == 1u) {
         base_srgb = agx_full_transform(composite_rgb_linear);
     } else if (is_raw == 1u) {
-        var srgb_emulated = linear_to_srgb(composite_rgb_linear);
-        const BRIGHTNESS_GAMMA: f32 = 1.1;
-        srgb_emulated = pow(srgb_emulated, vec3<f32>(1.0 / BRIGHTNESS_GAMMA));
-        const CONTRAST_MIX: f32 = 0.75;
-        let contrast_curve = srgb_emulated * srgb_emulated * (3.0 - 2.0 * srgb_emulated);
-        base_srgb = mix(srgb_emulated, contrast_curve, CONTRAST_MIX);
+        // The previous curve here was a smoothstep at 75% mix. smoothstep has zero
+        // slope at black, so every RAW arrived at the sliders with its shadows
+        // already crushed (slope 0.42 below sRGB 64) and no way to get them back.
+        // Shoulder in linear space, before encoding. Applied after encoding there is
+        // almost no headroom left between the knee and 1.0, so the whole over-range
+        // collapses into a couple of output levels and the highlight still reads as a
+        // flat disc. In linear space a wide input range maps to a wide output range.
+        //
+        // Extended, not the clamping variant: linear_to_srgb clips its input to 1.0,
+        // which would throw the over-range away before the shoulder could use it.
+        let rolled = highlight_shoulder3(max(composite_rgb_linear, vec3<f32>(0.0)));
+        let srgb_emulated = pow(
+            max(linear_to_srgb_extended(rolled), vec3<f32>(0.0)),
+            vec3<f32>(1.0 / BASE_BRIGHTNESS_GAMMA)
+        );
+        base_srgb = highlight_lift3(soft_s_curve3(srgb_emulated, BASE_CURVE_STRENGTH));
     } else {
         base_srgb = linear_to_srgb(composite_rgb_linear);
     }
